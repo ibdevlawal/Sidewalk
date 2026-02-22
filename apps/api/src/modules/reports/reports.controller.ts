@@ -3,6 +3,8 @@ import crypto from 'crypto';
 import { stellarService } from '../../config/stellar';
 import { AppError } from '../../core/errors/app-error';
 import { logger } from '../../core/logging/logger';
+import { ReportModel } from './report.model';
+import { buildDeterministicSnapshot, hashSnapshot } from './reports.snapshot';
 import {
   CreateReportDTO,
   ReportsMapQueryDTO,
@@ -17,16 +19,34 @@ export const createReport = async (
   next: NextFunction,
 ) => {
   try {
-    const { description } = req.body as CreateReportDTO;
+    const { title, description, category, location, media_urls } =
+      req.body as CreateReportDTO;
 
-    const contentHash = crypto
-      .createHash('sha256')
-      .update(description, 'utf8')
-      .digest('hex');
+    const snapshotPayload = {
+      title,
+      description,
+      category,
+      location,
+      media_urls: media_urls ?? [],
+      userId: req.user?.id ?? null,
+    };
+    const snapshot = buildDeterministicSnapshot(snapshotPayload);
+    const contentHash = hashSnapshot(snapshot);
     const txHash = await stellarService.anchorHash(contentHash);
+
+    const report = await ReportModel.create({
+      title,
+      description,
+      category,
+      location,
+      media_urls: media_urls ?? [],
+      snapshot_hash: contentHash,
+      stellar_tx_hash: txHash,
+    });
 
     return res.status(201).json({
       message: 'Report created and anchored',
+      report_id: String(report._id),
       content_hash: contentHash,
       stellar_tx: txHash,
       explorer_url: stellarService.getExplorerUrl(txHash),

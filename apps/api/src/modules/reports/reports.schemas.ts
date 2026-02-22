@@ -10,7 +10,26 @@ const trimmed = (label: string) =>
     .min(1, `${label} is required`);
 
 export const createReportBodySchema = z.object({
+  title: trimmed("title"),
   description: trimmed("description"),
+  category: z.enum(
+    ["INFRASTRUCTURE", "SANITATION", "SAFETY", "UTILITIES", "TRAFFIC", "OTHER"],
+    {
+      required_error: "category is required",
+      invalid_type_error: "category must be a valid enum value",
+    },
+  ),
+  location: z.object({
+    type: z.literal("Point"),
+    coordinates: z
+      .tuple([z.number(), z.number()])
+      .refine(
+        ([lng, lat]) =>
+          lng >= -180 && lng <= 180 && lat >= -90 && lat <= 90,
+        "location.coordinates must be [lng, lat] with valid ranges",
+      ),
+  }),
+  media_urls: z.array(z.string().url("media_urls items must be valid URLs")).optional(),
 });
 
 export const verifyReportBodySchema = z.object({
