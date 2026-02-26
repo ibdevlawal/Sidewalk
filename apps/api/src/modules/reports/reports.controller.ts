@@ -5,7 +5,7 @@ import { AppError } from '../../core/errors/app-error';
 import { logger } from '../../core/logging/logger';
 import { MediaUploadModel } from '../media/media-upload.model';
 import { ReportModel } from './report.model';
-import { buildDeterministicSnapshot, hashSnapshot } from './reports.snapshot';
+import { enqueueStellarAnchor } from './reports.anchor.queue';
 import {
   CreateReportDTO,
   ReportsMapQueryDTO,
@@ -63,18 +63,22 @@ export const createReport = async (
       }
     }
 
-    const snapshotPayload = {
-      title,
-      description,
-      category,
-      location,
-      media_urls: mediaUrls,
-      userId: req.user?.id ?? null,
-    };
-    const snapshot = buildDeterministicSnapshot(snapshotPayload);
-    const contentHash = hashSnapshot(snapshot);
+    const contentHash = crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify({ title, description, category, location, media_urls: mediaUrls }),
+        'utf8',
+      )
+      .digest('hex');
 
     const report = await ReportModel.create({
+      reporter_user_id: req.user?.id ?? null,
+      data_hash: contentHash,
+      anchor_status: 'ANCHOR_QUEUED',
+      anchor_attempts: 0,
+      anchor_last_error: null,
+      anchor_needs_attention: false,
+      anchor_failed_at: null,
       title,
       description,
       category,
@@ -87,18 +91,21 @@ export const createReport = async (
       integrity_flag: integrityFlag,
     });
 
-    const txHash = await stellarService.anchorHash(contentHash);
-    await ReportModel.updateOne({ _id: report._id }, { $set: { stellar_tx_hash: txHash } });
+    await enqueueStellarAnchor({
+      reportId: String(report._id),
+      dataHash: contentHash,
+    });
 
-    return res.status(201).json({
-      message: 'Report created and anchored',
-      report_id: String(report._id),
+    return res.status(202).json({
+      message: 'Report accepted; anchoring queued',
+      report_id: report._id,
       content_hash: contentHash,
-      stellar_tx: txHash,
+      stellar_tx: null,
+      anchor_status: 'ANCHOR_QUEUED',
       exif_verified: exifVerified,
       exif_distance_meters: exifDistanceMeters,
       integrity_flag: integrityFlag,
-      explorer_url: stellarService.getExplorerUrl(txHash),
+      explorer_url: null,
     });
   } catch (error) {
     return next(error);

@@ -8,6 +8,11 @@ import reportsRoutes from "./modules/reports/reports.routes";
 import authRoutes from "./modules/auth/auth.routes";
 import mediaRoutes from "./modules/media/media.routes";
 import { startMediaProcessingWorker } from "./modules/media/media.queue";
+import {
+  ensureMediaCleanupSchedule,
+  startMediaCleanupWorker,
+} from "./modules/media/media.cleanup.queue";
+import { startStellarAnchorWorker } from "./modules/reports/reports.anchor.queue";
 import { logger } from "./core/logging/logger";
 import { requestLogger } from "./core/logging/request-logger.middleware";
 import { errorHandler, notFoundHandler } from "./core/errors/error-handler";
@@ -23,6 +28,7 @@ app.set("trust proxy", 1);
 // Root level health checks
 app.get("/live", getLiveness);
 app.get("/ready", getReadiness);
+app.get("/api/health", getReadiness);
 
 app.use(cors());
 app.use(express.json());
@@ -43,7 +49,14 @@ const startServer = async () => {
 
     if (process.env.ENABLE_MEDIA_WORKER !== "false") {
       startMediaProcessingWorker();
-      logger.info("Media processing worker initialized");
+      startMediaCleanupWorker();
+      await ensureMediaCleanupSchedule();
+      logger.info("Media workers initialized (processing + orphan cleanup)");
+    }
+
+    if (process.env.ENABLE_STELLAR_ANCHOR_WORKER !== "false") {
+      startStellarAnchorWorker();
+      logger.info("Stellar anchor worker initialized");
     }
 
     app.listen(PORT, () => {

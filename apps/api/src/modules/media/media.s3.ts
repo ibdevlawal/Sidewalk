@@ -1,7 +1,10 @@
 import { randomUUID } from 'crypto';
 import { Upload } from '@aws-sdk/lib-storage';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import {
+  DeleteObjectCommand,
   GetObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   PutObjectCommandInput,
   S3Client,
@@ -44,7 +47,7 @@ const extensionForMime = (mime: string) => {
   return '';
 };
 
-const buildObjectUrl = (objectKey: string) => {
+export const buildObjectUrl = (objectKey: string) => {
   const publicBase = process.env.S3_PUBLIC_BASE_URL;
   if (publicBase) {
     return `${publicBase.replace(/\/+$/, '')}/${objectKey}`;
@@ -127,6 +130,66 @@ export const compressAndReplaceImage = async (objectKey: string): Promise<void> 
       Key: objectKey,
       Body: optimizedBuffer,
       ContentType: 'image/webp',
+    }),
+  );
+};
+
+export const generatePresignedGetObjectUrl = async (
+  objectKey: string,
+  expiresInSeconds = 900,
+): Promise<string> => {
+  return getSignedUrl(
+    client as never,
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: objectKey,
+    }) as never,
+    { expiresIn: expiresInSeconds },
+  );
+};
+
+export type S3ListedObject = {
+  key: string;
+  lastModified: Date | null;
+  url: string;
+};
+
+export const listAllReportObjects = async (): Promise<S3ListedObject[]> => {
+  const results: S3ListedObject[] = [];
+  let continuationToken: string | undefined;
+
+  do {
+    const response = await client.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: 'reports/',
+        ContinuationToken: continuationToken,
+      }),
+    );
+
+    for (const item of response.Contents ?? []) {
+      if (!item.Key) {
+        continue;
+      }
+
+      results.push({
+        key: item.Key,
+        lastModified: item.LastModified ?? null,
+        url: buildObjectUrl(item.Key),
+      });
+    }
+
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken);
+
+  return results;
+};
+
+export const deleteObjectFromS3 = async (objectKey: string): Promise<void> => {
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket: bucket,
+      Key: objectKey,
     }),
   );
 };

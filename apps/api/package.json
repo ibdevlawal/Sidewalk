@@ -7,6 +7,7 @@
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "worker:media": "tsx src/scripts/media-worker.ts",
+    "worker:stellar-anchor": "tsx src/scripts/stellar-anchor-worker.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test:integration": "cross-env STELLAR_SECRET_KEY=SDKBDNGEOYL66LGFJCJSSPEP52XAGONWJDAT5WL5PF262I2LJYAJGWHU tsx --test src/**/*.integration.test.ts",
@@ -17,6 +18,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.995.0",
     "@aws-sdk/lib-storage": "^3.995.0",
+    "@aws-sdk/s3-request-presigner": "^3.998.0",
     "@faker-js/faker": "^9.9.0",
     "@sidewalk/stellar": "workspace:*",
     "@stellar/stellar-sdk": "^14.5.0",
