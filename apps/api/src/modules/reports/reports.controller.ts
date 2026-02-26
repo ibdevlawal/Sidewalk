@@ -66,7 +66,7 @@ export const createReport = async (
     const contentHash = crypto
       .createHash('sha256')
       .update(
-        JSON.stringify({ title, description, category, location, media_urls }),
+        JSON.stringify({ title, description, category, location, media_urls: mediaUrls }),
         'utf8',
       )
       .digest('hex');

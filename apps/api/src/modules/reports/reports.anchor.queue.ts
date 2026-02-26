@@ -42,6 +42,7 @@ export const enqueueStellarAnchor = async (payload: StellarAnchorJob): Promise<v
   }
 
   await stellarAnchorQueue.add(JOB_NAME, payload, {
+    jobId: `anchor-report:${payload.reportId}`,
     removeOnComplete: 1000,
     removeOnFail: 1000,
     attempts: 10,
@@ -61,6 +62,7 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
     _id: 1,
     stellar_tx_hash: 1,
     anchor_status: 1,
+    data_hash: 1,
   });
 
   if (!report) {
@@ -79,6 +81,13 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
     return;
   }
 
+  if (report.anchor_status === 'ANCHOR_FAILED') {
+    logger.warn('Anchor job skipped; report already marked permanently failed', {
+      reportId,
+    });
+    return;
+  }
+
   await ReportModel.updateOne(
     { _id: reportId },
     {
@@ -92,7 +101,8 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
   );
 
   try {
-    const txHash = await stellarService.anchorHash(dataHash);
+    const anchorHash = report.data_hash || dataHash;
+    const txHash = await stellarService.anchorHash(anchorHash);
     await ReportModel.updateOne(
       { _id: reportId },
       {
