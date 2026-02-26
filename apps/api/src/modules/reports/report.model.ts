@@ -15,6 +15,9 @@ export const REPORT_CATEGORIES = [
   'LIGHTING',
   'TRANSPORT',
   'DRAINAGE',
+  'UTILITIES',
+  'TRAFFIC',
+  'OTHER',
 ] as const;
 
 export type ReportStatus = (typeof REPORT_STATUSES)[number];
@@ -39,6 +42,7 @@ export interface Report {
   category: ReportCategory;
   location: ReportLocation;
   stellar_tx_hash: string | null;
+  snapshot_hash: string | null;
   media_urls: string[];
   exif_verified: boolean;
   exif_distance_meters: number | null;
@@ -113,11 +117,13 @@ const reportSchema = new Schema<Report>(
       enum: REPORT_STATUSES,
       default: 'PENDING',
       required: true,
+      index: true,
     },
     category: {
       type: String,
       enum: REPORT_CATEGORIES,
       required: true,
+      index: true,
     },
     location: {
       type: {
@@ -150,6 +156,11 @@ const reportSchema = new Schema<Report>(
       default: null,
       index: true,
     },
+    snapshot_hash: {
+      type: String,
+      default: null,
+      index: true,
+    },
     media_urls: {
       type: [String],
       default: [],
@@ -162,6 +173,7 @@ const reportSchema = new Schema<Report>(
     exif_distance_meters: {
       type: Number,
       default: null,
+      index: true,
     },
     integrity_flag: {
       type: String,
