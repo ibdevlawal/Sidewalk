@@ -28,9 +28,11 @@ export type ReportLocation = {
 export interface Report {
   reporter_user_id: string | null;
   data_hash: string;
-  anchor_status: 'PENDING_ANCHOR' | 'ANCHORED' | 'FAILED';
+  anchor_status: 'ANCHOR_QUEUED' | 'ANCHOR_SUCCESS' | 'ANCHOR_FAILED';
   anchor_attempts: number;
   anchor_last_error: string | null;
+  anchor_needs_attention: boolean;
+  anchor_failed_at: Date | null;
   title: string;
   description: string;
   status: ReportStatus;
@@ -65,8 +67,8 @@ const reportSchema = new Schema<Report>(
     },
     anchor_status: {
       type: String,
-      enum: ['PENDING_ANCHOR', 'ANCHORED', 'FAILED'],
-      default: 'PENDING_ANCHOR',
+      enum: ['ANCHOR_QUEUED', 'ANCHOR_SUCCESS', 'ANCHOR_FAILED'],
+      default: 'ANCHOR_QUEUED',
       index: true,
     },
     anchor_attempts: {
@@ -77,6 +79,16 @@ const reportSchema = new Schema<Report>(
     anchor_last_error: {
       type: String,
       default: null,
+    },
+    anchor_needs_attention: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    anchor_failed_at: {
+      type: Date,
+      default: null,
+      index: true,
     },
     title: {
       type: String,

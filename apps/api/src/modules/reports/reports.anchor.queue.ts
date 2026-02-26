@@ -68,7 +68,10 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
     return;
   }
 
-  if (report.stellar_tx_hash) {
+  if (
+    report.stellar_tx_hash ||
+    report.anchor_status === 'ANCHOR_SUCCESS'
+  ) {
     logger.info('Anchor job skipped; report already anchored', {
       reportId,
       txHash: report.stellar_tx_hash,
@@ -80,7 +83,11 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
     { _id: reportId },
     {
       $inc: { anchor_attempts: 1 },
-      $set: { anchor_status: 'PENDING_ANCHOR' },
+      $set: {
+        anchor_status: 'ANCHOR_QUEUED',
+        anchor_needs_attention: false,
+        anchor_failed_at: null,
+      },
     },
   );
 
@@ -91,8 +98,10 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
       {
         $set: {
           stellar_tx_hash: txHash,
-          anchor_status: 'ANCHORED',
+          anchor_status: 'ANCHOR_SUCCESS',
           anchor_last_error: null,
+          anchor_needs_attention: false,
+          anchor_failed_at: null,
         },
       },
     );
@@ -100,16 +109,27 @@ const processAnchorJob = async (job: Job<StellarAnchorJob>): Promise<void> => {
     logger.info('Report anchored successfully', { reportId, txHash });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const isFinalFailure = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
     await ReportModel.updateOne(
       { _id: reportId },
       {
         $set: {
           anchor_last_error: message,
-          anchor_status:
-            job.attemptsMade + 1 >= (job.opts.attempts ?? 1) ? 'FAILED' : 'PENDING_ANCHOR',
+          anchor_status: isFinalFailure ? 'ANCHOR_FAILED' : 'ANCHOR_QUEUED',
+          anchor_needs_attention: isFinalFailure,
+          anchor_failed_at: isFinalFailure ? new Date() : null,
         },
       },
     );
+
+    if (isFinalFailure) {
+      logger.error('Anchor job exhausted retries; compensating state applied', {
+        reportId,
+        anchorStatus: 'ANCHOR_FAILED',
+        dashboardAlert: true,
+        reason: message,
+      });
+    }
     throw error;
   }
 };
