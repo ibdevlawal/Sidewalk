@@ -121,6 +121,10 @@ const boundsQuerySchema = z
     path: ['minLng'],
   });
 
+export const reportParamsSchema = z.object({
+  reportId: z.string().trim().regex(/^[a-fA-F0-9]{24}$/, 'reportId must be a valid ObjectId'),
+});
+
 export const reportsMapQuerySchema = z.union([radiusQuerySchema, boundsQuerySchema]);
 
 export type CreateReportDTO = z.infer<typeof createReportBodySchema>;
@@ -128,3 +132,4 @@ export type VerifyReportDTO = z.infer<typeof verifyReportBodySchema>;
 export type UpdateReportStatusDTO = z.infer<typeof updateReportStatusBodySchema>;
 export type VerifyStatusDTO = z.infer<typeof verifyStatusBodySchema>;
 export type ReportsMapQueryDTO = z.infer<typeof reportsMapQuerySchema>;
+export type ReportParamsDTO = z.infer<typeof reportParamsSchema>;

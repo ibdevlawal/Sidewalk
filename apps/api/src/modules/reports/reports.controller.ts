@@ -4,10 +4,12 @@ import { stellarService } from '../../config/stellar';
 import { AppError } from '../../core/errors/app-error';
 import { logger } from '../../core/logging/logger';
 import { MediaUploadModel } from '../media/media-upload.model';
+import { StatusUpdateModel } from './status-update.model';
 import { ReportModel } from './report.model';
 import { enqueueStellarAnchor } from './reports.anchor.queue';
 import {
   CreateReportDTO,
+  ReportParamsDTO,
   ReportsMapQueryDTO,
   UpdateReportStatusDTO,
   VerifyReportDTO,
@@ -293,6 +295,92 @@ export const getMapReports = async (
         status: pin.status,
         category: pin.category,
       })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getReportById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { reportId } = req.params as unknown as ReportParamsDTO;
+
+    const report = await ReportModel.findById(reportId).lean();
+    if (!report) {
+      throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
+    }
+    const reportWithTimestamps = report as typeof report & {
+      createdAt?: Date;
+      updatedAt?: Date;
+    };
+
+    const history = await StatusUpdateModel.find({ reportId: report._id })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const media = report.media_urls.length
+      ? await MediaUploadModel.find({ url: { $in: report.media_urls } })
+          .select({
+            _id: 1,
+            url: 1,
+            optimized_url: 1,
+            processing_status: 1,
+            exif_verified: 1,
+          })
+          .lean()
+      : [];
+
+    return res.status(200).json({
+      data: {
+        id: String(report._id),
+        title: report.title,
+        description: report.description,
+        category: report.category,
+        status: report.status,
+        location: report.location,
+        media: media.map((item) => ({
+          id: String(item._id),
+          url: item.optimized_url ?? item.url,
+          originalUrl: item.url,
+          processingStatus: item.processing_status,
+          exifVerified: item.exif_verified,
+        })),
+        anchor: {
+          status: report.anchor_status,
+          attempts: report.anchor_attempts,
+          txHash: report.stellar_tx_hash,
+          lastError: report.anchor_last_error,
+          needsAttention: report.anchor_needs_attention,
+          failedAt: report.anchor_failed_at?.toISOString() ?? null,
+          snapshotHash: report.snapshot_hash,
+          contentHash: report.data_hash,
+          explorerUrl: report.stellar_tx_hash
+            ? stellarService.getExplorerUrl(report.stellar_tx_hash)
+            : null,
+        },
+        integrity: {
+          exifVerified: report.exif_verified,
+          exifDistanceMeters: report.exif_distance_meters,
+          flag: report.integrity_flag,
+        },
+        history: history.map((entry) => ({
+          id: String(entry._id),
+          previousStatus: entry.previousStatus,
+          nextStatus: entry.nextStatus,
+          note: entry.note ?? null,
+          actorId: entry.actorId ? String(entry.actorId) : null,
+          createdAt:
+            (entry as typeof entry & { createdAt?: Date }).createdAt?.toISOString() ?? null,
+          updatedAt:
+            (entry as typeof entry & { updatedAt?: Date }).updatedAt?.toISOString() ?? null,
+        })),
+        createdAt: reportWithTimestamps.createdAt?.toISOString() ?? null,
+        updatedAt: reportWithTimestamps.updatedAt?.toISOString() ?? null,
+      },
     });
   } catch (error) {
     return next(error);
