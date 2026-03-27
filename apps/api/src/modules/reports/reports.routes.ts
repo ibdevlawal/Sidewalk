@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import {
   createReport,
+  getReportById,
+  listReports,
   getMapReports,
   verifyReport,
   updateReportStatus,
@@ -11,6 +13,8 @@ import { validateRequest } from '../../core/validation/validate-request';
 import { stellarAnchoringRateLimiter } from '../../core/rate-limit/rate-limit.middleware';
 import {
   createReportBodySchema,
+  reportParamsSchema,
+  listReportsQuerySchema,
   reportsMapQuerySchema,
   updateReportStatusBodySchema,
   verifyReportBodySchema,
@@ -18,6 +22,14 @@ import {
 } from './reports.schemas';
 
 const router: Router = Router();
+
+router.get(
+  '/',
+  authenticateToken,
+  requireRole(['CITIZEN', 'AGENCY_ADMIN']),
+  validateRequest({ query: listReportsQuerySchema }),
+  listReports,
+);
 
 router.get(
   '/map',
@@ -34,6 +46,14 @@ router.post(
   stellarAnchoringRateLimiter,
   validateRequest({ body: createReportBodySchema }),
   createReport,
+);
+
+router.get(
+  '/:reportId',
+  authenticateToken,
+  requireRole(['CITIZEN', 'AGENCY_ADMIN']),
+  validateRequest({ params: reportParamsSchema }),
+  getReportById,
 );
 
 router.post(

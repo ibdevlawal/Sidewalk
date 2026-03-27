@@ -141,6 +141,10 @@ cp apps/api/.env.example apps/api/.env
 
 ```
 
+For local-only bootstrap sessions, keep `/api/auth/dev/session` disabled unless you explicitly set
+`ALLOW_DEV_SESSION=true` and `DEV_SESSION_SECRET`, then pass the secret through the
+`x-dev-session-secret` header.
+
 ---
 
 ## 🏃‍♂️ Running the Project

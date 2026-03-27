@@ -1,18 +1,31 @@
 import { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
+import { Types } from 'mongoose';
 import { stellarService } from '../../config/stellar';
 import { AppError } from '../../core/errors/app-error';
 import { logger } from '../../core/logging/logger';
 import { MediaUploadModel } from '../media/media-upload.model';
-import { ReportModel } from './report.model';
+import { UserModel } from '../users/user.model';
+import { ReportModel, type ReportStatus } from './report.model';
 import { enqueueStellarAnchor } from './reports.anchor.queue';
+import { StatusUpdateModel } from './status-update.model';
 import {
   CreateReportDTO,
+  ReportParamsDTO,
+  ListReportsQueryDTO,
   ReportsMapQueryDTO,
   UpdateReportStatusDTO,
   VerifyReportDTO,
   VerifyStatusDTO,
 } from './reports.schemas';
+
+const ALLOWED_STATUS_TRANSITIONS: Record<ReportStatus, ReportStatus[]> = {
+  PENDING: ['ACKNOWLEDGED', 'REJECTED', 'ESCALATED'],
+  ACKNOWLEDGED: ['RESOLVED', 'REJECTED', 'ESCALATED'],
+  RESOLVED: [],
+  REJECTED: [],
+  ESCALATED: ['ACKNOWLEDGED', 'RESOLVED', 'REJECTED'],
+};
 
 const haversineMeters = (
   fromLat: number,
@@ -119,6 +132,19 @@ export const updateReportStatus = async (
 ) => {
   try {
     const { originalTxHash, status, evidence } = req.body as UpdateReportStatusDTO;
+    const report = await ReportModel.findOne({ stellar_tx_hash: originalTxHash });
+
+    if (!report) {
+      throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
+    }
+
+    if (report.status === status) {
+      throw new AppError('Report is already in the requested status', 409, 'STATUS_UNCHANGED');
+    }
+
+    if (!ALLOWED_STATUS_TRANSITIONS[report.status].includes(status)) {
+      throw new AppError('Invalid report status transition', 400, 'INVALID_STATUS_TRANSITION');
+    }
 
     const dataToHash = `${originalTxHash}:${status}:${evidence ?? ''}`;
     const statusHash = crypto
@@ -127,12 +153,107 @@ export const updateReportStatus = async (
       .digest('hex');
     const statusTxHash = await stellarService.anchorHash(statusHash);
 
+    const actorId =
+      req.user?.id && Types.ObjectId.isValid(req.user.id)
+        ? new Types.ObjectId(req.user.id)
+        : undefined;
+
+    await StatusUpdateModel.create({
+      reportId: report._id,
+      previousStatus: report.status,
+      nextStatus: status,
+      note: evidence,
+      ...(actorId ? { actorId } : {}),
+    });
+
+    report.status = status;
+    await report.save();
+
     return res.status(200).json({
       message: 'Status updated and anchored',
       status,
       original_report_tx: originalTxHash,
       status_update_tx: statusTxHash,
       explorer_url: stellarService.getExplorerUrl(statusTxHash),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const listReports = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const query = req.query as unknown as ListReportsQueryDTO;
+    const page = query.page ?? 1;
+    const pageSize = query.pageSize ?? 20;
+    const sortField: 'createdAt' | 'updatedAt' = query.sort ?? 'createdAt';
+    const sortOrder = query.order === 'asc' ? 1 : -1;
+    const filter: Record<string, unknown> = {};
+
+    if (query.status) {
+      filter.status = query.status;
+    }
+
+    if (query.category) {
+      filter.category = query.category;
+    }
+
+    if (query.mine) {
+      filter.reporter_user_id = req.user?.id ?? '__missing__';
+    } else if (query.reporterId) {
+      filter.reporter_user_id = query.reporterId;
+    }
+
+    if (query.district) {
+      const matchingUsers = await UserModel.find({ district: query.district })
+        .select({ _id: 1 })
+        .lean();
+
+      filter.reporter_user_id = {
+        $in: matchingUsers.map((user) => String(user._id)),
+      };
+    }
+
+    const [reports, total] = await Promise.all([
+      ReportModel.find(filter)
+        .sort({ [sortField]: sortOrder })
+        .skip((Number(page) - 1) * Number(pageSize))
+        .limit(pageSize)
+        .lean(),
+      ReportModel.countDocuments(filter),
+    ]);
+
+    return res.status(200).json({
+      data: reports.map((report) => {
+        const withTimestamps = report as typeof report & {
+          createdAt?: Date;
+          updatedAt?: Date;
+        };
+
+        return {
+          id: String(report._id),
+          title: report.title,
+          category: report.category,
+          status: report.status,
+          location: report.location,
+          reporterUserId: report.reporter_user_id,
+          anchorStatus: report.anchor_status,
+          stellarTxHash: report.stellar_tx_hash,
+          integrityFlag: report.integrity_flag,
+          createdAt: withTimestamps.createdAt?.toISOString() ?? null,
+          updatedAt: withTimestamps.updatedAt?.toISOString() ?? null,
+        };
+      }),
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / Number(pageSize)),
+      },
     });
   } catch (error) {
     return next(error);
@@ -293,6 +414,92 @@ export const getMapReports = async (
         status: pin.status,
         category: pin.category,
       })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getReportById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { reportId } = req.params as unknown as ReportParamsDTO;
+
+    const report = await ReportModel.findById(reportId).lean();
+    if (!report) {
+      throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
+    }
+    const reportWithTimestamps = report as typeof report & {
+      createdAt?: Date;
+      updatedAt?: Date;
+    };
+
+    const history = await StatusUpdateModel.find({ reportId: report._id })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const media = report.media_urls.length
+      ? await MediaUploadModel.find({ url: { $in: report.media_urls } })
+          .select({
+            _id: 1,
+            url: 1,
+            optimized_url: 1,
+            processing_status: 1,
+            exif_verified: 1,
+          })
+          .lean()
+      : [];
+
+    return res.status(200).json({
+      data: {
+        id: String(report._id),
+        title: report.title,
+        description: report.description,
+        category: report.category,
+        status: report.status,
+        location: report.location,
+        media: media.map((item) => ({
+          id: String(item._id),
+          url: item.optimized_url ?? item.url,
+          originalUrl: item.url,
+          processingStatus: item.processing_status,
+          exifVerified: item.exif_verified,
+        })),
+        anchor: {
+          status: report.anchor_status,
+          attempts: report.anchor_attempts,
+          txHash: report.stellar_tx_hash,
+          lastError: report.anchor_last_error,
+          needsAttention: report.anchor_needs_attention,
+          failedAt: report.anchor_failed_at?.toISOString() ?? null,
+          snapshotHash: report.snapshot_hash,
+          contentHash: report.data_hash,
+          explorerUrl: report.stellar_tx_hash
+            ? stellarService.getExplorerUrl(report.stellar_tx_hash)
+            : null,
+        },
+        integrity: {
+          exifVerified: report.exif_verified,
+          exifDistanceMeters: report.exif_distance_meters,
+          flag: report.integrity_flag,
+        },
+        history: history.map((entry) => ({
+          id: String(entry._id),
+          previousStatus: entry.previousStatus,
+          nextStatus: entry.nextStatus,
+          note: entry.note ?? null,
+          actorId: entry.actorId ? String(entry.actorId) : null,
+          createdAt:
+            (entry as typeof entry & { createdAt?: Date }).createdAt?.toISOString() ?? null,
+          updatedAt:
+            (entry as typeof entry & { updatedAt?: Date }).updatedAt?.toISOString() ?? null,
+        })),
+        createdAt: reportWithTimestamps.createdAt?.toISOString() ?? null,
+        updatedAt: reportWithTimestamps.updatedAt?.toISOString() ?? null,
+      },
     });
   } catch (error) {
     return next(error);
