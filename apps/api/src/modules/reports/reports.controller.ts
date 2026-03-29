@@ -1,21 +1,31 @@
 import { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
+import { Types } from 'mongoose';
 import { stellarService } from '../../config/stellar';
 import { AppError } from '../../core/errors/app-error';
 import { logger } from '../../core/logging/logger';
+import { MediaDraftModel } from '../media/media-draft.model';
 import { MediaUploadModel } from '../media/media-upload.model';
+import { StatusUpdateModel } from './status-update.model';
 import { ReportModel } from './report.model';
 import { enqueueStellarAnchor } from './reports.anchor.queue';
 import { StatusUpdateModel } from './status-update.model';
 import {
   CreateReportDTO,
-  ReportDetailParamsDTO,
-  ReportMineQueryDTO,
+  ListReportsQueryDTO,
   ReportsMapQueryDTO,
   UpdateReportStatusDTO,
   VerifyReportDTO,
   VerifyStatusDTO,
 } from './reports.schemas';
+
+const ALLOWED_STATUS_TRANSITIONS: Record<ReportStatus, ReportStatus[]> = {
+  PENDING: ['ACKNOWLEDGED', 'REJECTED', 'ESCALATED'],
+  ACKNOWLEDGED: ['RESOLVED', 'REJECTED', 'ESCALATED'],
+  RESOLVED: [],
+  REJECTED: [],
+  ESCALATED: ['ACKNOWLEDGED', 'RESOLVED', 'REJECTED'],
+};
 
 const haversineMeters = (
   fromLat: number,
@@ -41,14 +51,37 @@ export const createReport = async (
   next: NextFunction,
 ) => {
   try {
-    const { title, description, category, location, media_urls } =
+    const { title, description, category, location, media_urls, draft_id } =
       req.body as CreateReportDTO;
+    const reporterId = req.user?.id ?? null;
 
     const mediaUrls = media_urls ?? [];
-    const firstMediaUrl = mediaUrls[0];
-    const mediaUpload = firstMediaUrl
-      ? await MediaUploadModel.findOne({ url: firstMediaUrl }).lean()
-      : null;
+    const mediaUploads = mediaUrls.length
+      ? await MediaUploadModel.find({ url: { $in: mediaUrls } }).lean()
+      : [];
+
+    if (mediaUploads.length !== mediaUrls.length) {
+      throw new AppError('One or more media uploads could not be found', 400, 'MEDIA_NOT_FOUND');
+    }
+
+    for (const upload of mediaUploads) {
+      if (upload.owner_user_id !== reporterId) {
+        throw new AppError('Media uploads must belong to the current user', 403, 'MEDIA_FORBIDDEN');
+      }
+
+      if (draft_id && upload.draft_id !== draft_id) {
+        throw new AppError('Media upload is not linked to the supplied draft', 400, 'MEDIA_DRAFT_MISMATCH');
+      }
+    }
+
+    if (draft_id) {
+      const draft = await MediaDraftModel.findById(draft_id);
+      if (!draft || draft.owner_user_id !== reporterId || draft.status !== 'OPEN') {
+        throw new AppError('Media draft not found', 404, 'MEDIA_DRAFT_NOT_FOUND');
+      }
+    }
+
+    const mediaUpload = mediaUploads[0] ?? null;
 
     let exifVerified = false;
     let exifDistanceMeters: number | null = null;
@@ -66,17 +99,17 @@ export const createReport = async (
       }
     }
 
-    const contentHash = crypto
-      .createHash('sha256')
-      .update(
-        JSON.stringify({ title, description, category, location, media_urls: mediaUrls }),
-        'utf8',
-      )
-      .digest('hex');
+    const snapshot = buildDeterministicSnapshot({
+      title,
+      description,
+      category,
+      location,
+      media_urls: mediaUrls,
+    });
+    const contentHash = hashSnapshot(snapshot);
 
     const report = await ReportModel.create({
-      reporter_user_id: req.user?.id ?? null,
-      district: req.user?.district ?? null,
+      reporter_user_id: reporterId,
       data_hash: contentHash,
       anchor_status: 'ANCHOR_QUEUED',
       anchor_attempts: 0,
@@ -100,6 +133,29 @@ export const createReport = async (
       dataHash: contentHash,
     });
 
+    if (mediaUrls.length > 0) {
+      await MediaUploadModel.updateMany(
+        { url: { $in: mediaUrls } },
+        {
+          $set: {
+            attached_report_id: String(report._id),
+            expires_at: null,
+          },
+        },
+      );
+    }
+
+    if (draft_id) {
+      await MediaDraftModel.updateOne(
+        { _id: draft_id },
+        {
+          $set: {
+            status: 'FINALIZED',
+          },
+        },
+      );
+    }
+
     return res.status(202).json({
       message: 'Report accepted; anchoring queued',
       report_id: report._id,
@@ -122,33 +178,19 @@ export const updateReportStatus = async (
   next: NextFunction,
 ) => {
   try {
-    const { originalTxHash, reportId, status, evidence } = req.body as UpdateReportStatusDTO;
+    const { originalTxHash, status, evidence } = req.body as UpdateReportStatusDTO;
+    const report = await ReportModel.findOne({ stellar_tx_hash: originalTxHash });
 
-    if (reportId) {
-      const report = await ReportModel.findById(reportId).lean();
-      if (!report) {
-        throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
-      }
+    if (!report) {
+      throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
+    }
 
-      const isAdmin = req.user?.role === 'AGENCY_ADMIN';
-      const requesterDistrict = req.user?.district;
-      if (
-        isAdmin &&
-        requesterDistrict &&
-        report.district &&
-        report.district !== requesterDistrict
-      ) {
-        throw new AppError('Forbidden across districts', 403, 'FORBIDDEN');
-      }
+    if (report.status === status) {
+      throw new AppError('Report is already in the requested status', 409, 'STATUS_UNCHANGED');
+    }
 
-      await StatusUpdateModel.create({
-        reportId: report._id,
-        previousStatus: report.status,
-        nextStatus: status,
-        note: evidence,
-      });
-
-      await ReportModel.updateOne({ _id: report._id }, { $set: { status } });
+    if (!ALLOWED_STATUS_TRANSITIONS[report.status].includes(status)) {
+      throw new AppError('Invalid report status transition', 400, 'INVALID_STATUS_TRANSITION');
     }
 
     const dataToHash = `${originalTxHash}:${status}:${evidence ?? ''}`;
@@ -157,6 +199,22 @@ export const updateReportStatus = async (
       .update(dataToHash, 'utf8')
       .digest('hex');
     const statusTxHash = await stellarService.anchorHash(statusHash);
+
+    const actorId =
+      req.user?.id && Types.ObjectId.isValid(req.user.id)
+        ? new Types.ObjectId(req.user.id)
+        : undefined;
+
+    await StatusUpdateModel.create({
+      reportId: report._id,
+      previousStatus: report.status,
+      nextStatus: status,
+      note: evidence,
+      ...(actorId ? { actorId } : {}),
+    });
+
+    report.status = status;
+    await report.save();
 
     return res.status(200).json({
       message: 'Status updated and anchored',
@@ -170,87 +228,79 @@ export const updateReportStatus = async (
   }
 };
 
-export const getMyReports = async (
+export const listReports = async (
   req: Request,
   res: Response,
   next: NextFunction,
 ) => {
   try {
-    const { page, pageSize } = req.query as unknown as ReportMineQueryDTO;
-    const filter =
-      req.user?.role === 'CITIZEN'
-        ? { reporter_user_id: req.user.id }
-        : req.user?.district
-          ? { district: req.user.district }
-          : {};
+    const query = req.query as unknown as ListReportsQueryDTO;
+    const page = query.page ?? 1;
+    const pageSize = query.pageSize ?? 20;
+    const sortField: 'createdAt' | 'updatedAt' = query.sort ?? 'createdAt';
+    const sortOrder = query.order === 'asc' ? 1 : -1;
+    const filter: Record<string, unknown> = {};
 
-    const reports = await ReportModel.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .lean()
-      .exec();
+    if (query.status) {
+      filter.status = query.status;
+    }
+
+    if (query.category) {
+      filter.category = query.category;
+    }
+
+    if (query.mine) {
+      filter.reporter_user_id = req.user?.id ?? '__missing__';
+    } else if (query.reporterId) {
+      filter.reporter_user_id = query.reporterId;
+    }
+
+    if (query.district) {
+      const matchingUsers = await UserModel.find({ district: query.district })
+        .select({ _id: 1 })
+        .lean();
+
+      filter.reporter_user_id = {
+        $in: matchingUsers.map((user) => String(user._id)),
+      };
+    }
+
+    const [reports, total] = await Promise.all([
+      ReportModel.find(filter)
+        .sort({ [sortField]: sortOrder })
+        .skip((Number(page) - 1) * Number(pageSize))
+        .limit(pageSize)
+        .lean(),
+      ReportModel.countDocuments(filter),
+    ]);
 
     return res.status(200).json({
-      data: reports.map((report) => ({
-        id: String(report._id),
-        title: report.title,
-        status: report.status,
-        category: report.category,
-        district: report.district ?? null,
-        created_at: (report as typeof report & { createdAt?: Date }).createdAt ?? null,
-      })),
-    });
-  } catch (error) {
-    return next(error);
-  }
-};
+      data: reports.map((report) => {
+        const withTimestamps = report as typeof report & {
+          createdAt?: Date;
+          updatedAt?: Date;
+        };
 
-export const getReportDetail = async (
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) => {
-  try {
-    const { reportId } = req.params as unknown as ReportDetailParamsDTO;
-    const report = await ReportModel.findById(reportId).lean();
-
-    if (!report) {
-      throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
-    }
-
-    if (req.user?.role === 'CITIZEN' && report.reporter_user_id !== req.user.id) {
-      throw new AppError('Forbidden', 403, 'FORBIDDEN');
-    }
-
-    if (
-      req.user?.role === 'AGENCY_ADMIN' &&
-      req.user.district &&
-      report.district &&
-      report.district !== req.user.district
-    ) {
-      throw new AppError('Forbidden across districts', 403, 'FORBIDDEN');
-    }
-
-    const updates = await StatusUpdateModel.find({ reportId: report._id })
-      .sort({ createdAt: -1 })
-      .lean()
-      .exec();
-
-    return res.status(200).json({
-      id: String(report._id),
-      title: report.title,
-      description: report.description,
-      status: report.status,
-      category: report.category,
-      district: report.district ?? null,
-      anchor_status: report.anchor_status,
-      media_urls: report.media_urls,
-      history: updates.map((update) => ({
-        status: update.nextStatus,
-        note: update.note ?? null,
-        createdAt: (update as typeof update & { createdAt?: Date }).createdAt ?? null,
-      })),
+        return {
+          id: String(report._id),
+          title: report.title,
+          category: report.category,
+          status: report.status,
+          location: report.location,
+          reporterUserId: report.reporter_user_id,
+          anchorStatus: report.anchor_status,
+          stellarTxHash: report.stellar_tx_hash,
+          integrityFlag: report.integrity_flag,
+          createdAt: withTimestamps.createdAt?.toISOString() ?? null,
+          updatedAt: withTimestamps.updatedAt?.toISOString() ?? null,
+        };
+      }),
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / Number(pageSize)),
+      },
     });
   } catch (error) {
     return next(error);
@@ -263,12 +313,11 @@ export const verifyReport = async (
   next: NextFunction,
 ) => {
   try {
-    const { txHash, originalDescription } = req.body as VerifyReportDTO;
+    const { txHash, originalDescription, report } = req.body as VerifyReportDTO;
 
-    const expectedHash = crypto
-      .createHash('sha256')
-      .update(originalDescription, 'utf8')
-      .digest('hex');
+    const expectedHash = report
+      ? hashSnapshot(buildDeterministicSnapshot(report))
+      : crypto.createHash('sha256').update(originalDescription ?? '', 'utf8').digest('hex');
     const result = await stellarService.verifyTransaction(txHash, expectedHash);
 
     if (!result.valid) {
@@ -295,6 +344,58 @@ export const verifyReport = async (
     return next(
       new AppError('Transaction not found', 404, 'TRANSACTION_NOT_FOUND'),
     );
+  }
+};
+
+export const getMyReports = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { page, pageSize } = req.query as unknown as MyReportsQueryDTO;
+    const reporterId = req.user?.id;
+
+    if (!reporterId) {
+      throw new AppError('Unauthorized', 401, 'UNAUTHORIZED');
+    }
+
+    const [reports, total] = await Promise.all([
+      ReportModel.find({ reporter_user_id: reporterId })
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .lean(),
+      ReportModel.countDocuments({ reporter_user_id: reporterId }),
+    ]);
+
+    return res.status(200).json({
+      data: reports.map((report) => {
+        const withTimestamps = report as typeof report & {
+          createdAt?: Date;
+          updatedAt?: Date;
+        };
+
+        return {
+          id: String(report._id),
+          title: report.title,
+          category: report.category,
+          status: report.status,
+          anchorStatus: report.anchor_status,
+          integrityFlag: report.integrity_flag,
+          createdAt: withTimestamps.createdAt?.toISOString() ?? null,
+          updatedAt: withTimestamps.updatedAt?.toISOString() ?? null,
+        };
+      }),
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+      },
+    });
+  } catch (error) {
+    return next(error);
   }
 };
 
@@ -411,6 +512,135 @@ export const getMapReports = async (
         status: pin.status,
         category: pin.category,
       })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getReportById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const query = req.query as unknown as ReportListQueryDTO;
+    const filter: Record<string, unknown> = {};
+
+    if (query.status) {
+      filter.status = query.status;
+    }
+
+    if (query.category) {
+      filter.category = query.category;
+    }
+
+    if (query.mine && req.user?.id) {
+      filter.reporter_user_id = req.user.id;
+    }
+
+    const page = query.page;
+    const pageSize = query.pageSize;
+
+    const [reports, total] = await Promise.all([
+      ReportModel.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .lean()
+        .exec(),
+      ReportModel.countDocuments(filter),
+    ]);
+    const typedReports = reports as Array<{
+      _id: unknown;
+      title: string;
+      category: string;
+      status: string;
+      anchor_status: string;
+      integrity_flag: string;
+      location: { type: 'Point'; coordinates: [number, number] };
+      createdAt?: Date;
+    }>;
+
+    return res.status(200).json({
+      page,
+      pageSize,
+      total,
+      data: typedReports.map((report) => ({
+        id: String(report._id),
+        title: report.title,
+        category: report.category,
+        status: report.status,
+        anchor_status: report.anchor_status,
+        integrity_flag: report.integrity_flag,
+        created_at: report.createdAt ?? null,
+        location: report.location,
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+export const getReportDetail = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { reportId } = req.params as unknown as ReportDetailParamsDTO;
+
+    const report = await ReportModel.findById(reportId).lean();
+    if (!report) {
+      throw new AppError('Report not found', 404, 'REPORT_NOT_FOUND');
+    }
+    const typedReport = report as typeof report & {
+      createdAt?: Date;
+      updatedAt?: Date;
+    };
+
+    const statusUpdates = await StatusUpdateModel.find({ reportId: report._id })
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+    const typedStatusUpdates = statusUpdates as Array<{
+      nextStatus: string;
+      note?: string | null;
+      createdAt?: Date;
+    }>;
+
+    return res.status(200).json({
+      id: String(report._id),
+      title: report.title,
+      description: report.description,
+      category: report.category,
+      status: report.status,
+      anchor_status: report.anchor_status,
+      anchor_attempts: report.anchor_attempts,
+      anchor_last_error: report.anchor_last_error,
+      integrity_flag: report.integrity_flag,
+      exif_verified: report.exif_verified,
+      exif_distance_meters: report.exif_distance_meters,
+      stellar_tx_hash: report.stellar_tx_hash,
+      snapshot_hash: report.snapshot_hash,
+      created_at: typedReport.createdAt ?? null,
+      updated_at: typedReport.updatedAt ?? null,
+      location: report.location,
+      media_urls: report.media_urls,
+      history: [
+        {
+          type: 'CREATED',
+          status: 'PENDING',
+          note: 'Report submitted',
+          createdAt: typedReport.createdAt ?? null,
+        },
+        ...typedStatusUpdates.map((update) => ({
+          type: 'STATUS_UPDATE',
+          status: update.nextStatus,
+          note: update.note ?? null,
+          createdAt: update.createdAt ?? null,
+        })),
+      ],
     });
   } catch (error) {
     return next(error);
