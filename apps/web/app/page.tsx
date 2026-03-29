@@ -26,6 +26,9 @@ export default function HomePage() {
           backend, and mobile contributors can work in parallel without inventing local setup.
         </p>
         <div className="actions">
+          <Link className="button button-primary" href="/auth/request-otp">
+            Open auth flow
+          </Link>
           <Link className="button button-primary" href="/health">
             Open health page
           </Link>
